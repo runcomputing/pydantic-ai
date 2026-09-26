@@ -35,6 +35,7 @@ import pydantic_core
 from genai_prices import types as genai_types
 from pydantic.alias_generators import to_snake
 from pydantic.dataclasses import dataclass as pydantic_dataclass
+from pydantic.json_schema import JsonSchemaValue
 from typing_extensions import TypeAliasType, TypeVar, assert_never
 
 from pydantic_ai._genai_prices import calculate_price_for_usage
@@ -1307,6 +1308,30 @@ class _RequireUrlMediaType:
             assert isinstance(choice, dict), choice
             schema['choices'][kind] = pydantic_core.core_schema.chain_schema([cls._names_a_media_type(), choice])
         return schema
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: pydantic_core.CoreSchema, handler: pydantic.GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        """Document each gated URL choice as the choice it gates.
+
+        Pydantic documents a chain by its first step in validation mode, which here is the anonymous
+        `media_type` mapping: the four URL choices would render as one inline object with no `$ref`,
+        and the OpenAPI `discriminator.mapping` pydantic emits for the tagged union would carry that
+        object where the specification requires a reference string, so FastAPI refuses to build an
+        `/openapi.json` for any route that publishes `ModelMessage`. The gate decides which arm claims
+        a value, not what the union accepts — a URL mapping without a `media_type` still lands on the
+        `Mapping` arm — so the choice's own schema is the exact description of the accepted input.
+        """
+        assert core_schema['type'] == 'tagged-union', core_schema['type']
+        choices = dict(core_schema['choices'])
+        for kind in _FILE_URL_KINDS:
+            gated = choices[kind]
+            assert gated['type'] == 'chain', gated['type']
+            choices[kind] = gated['steps'][-1]
+        documented = core_schema.copy()
+        documented['choices'] = choices
+        return handler(documented)
 
     @staticmethod
     def _names_a_media_type() -> pydantic_core.CoreSchema:

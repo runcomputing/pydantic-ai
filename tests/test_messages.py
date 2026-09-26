@@ -14,6 +14,7 @@ from typing import Annotated, Any, Literal, cast, get_args, get_origin, overload
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
+from pydantic.json_schema import JsonSchemaMode
 from pydantic_core import to_json, to_jsonable_python
 
 from pydantic_ai import (
@@ -1738,6 +1739,48 @@ def test_message_json_schema_keeps_the_multimodal_definitions_intact():
 
     assert {content_type.__name__ for content_type in MULTI_MODAL_CONTENT_TYPES} <= defs.keys()
     assert sorted(name for name in defs if 'ImageUrl' in name) == snapshot(['ImageUrl'])
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_message_json_schema_documents_each_gated_url_choice_by_reference(mode: JsonSchemaMode):
+    """The tool-return gate is invisible in a generated JSON schema.
+
+    Pydantic documents a chain by its first step in validation mode, so a gated URL choice would read
+    as the anonymous `media_type` mapping: the four collapse into one inline object, and the OpenAPI
+    `discriminator.mapping` pydantic emits for the tagged union carries that object where the
+    specification requires a reference string — FastAPI then refuses to build `/openapi.json` for any
+    route that publishes `ModelMessage`. The gate decides which arm claims a value, not what the union
+    accepts, so each choice documents as the definition it gates, in both modes alike.
+    """
+    defs = ModelMessagesTypeAdapter.json_schema(mode=mode)['$defs']
+
+    for name, definition in defs.items():
+        for subschema in (definition, *definition.get('anyOf', []), *definition.get('oneOf', [])):
+            mapping = subschema.get('discriminator', {}).get('mapping', {})
+            assert all(isinstance(target, str) for target in mapping.values()), (name, mapping)
+
+    (tool_return_content_name,) = [name for name in defs if name.startswith('ToolReturnContent')]
+    (multimodal,) = [arm for arm in defs[tool_return_content_name]['anyOf'] if 'discriminator' in arm]
+    assert multimodal['discriminator']['mapping'] == snapshot(
+        {
+            'image-url': '#/$defs/ImageUrl',
+            'audio-url': '#/$defs/AudioUrl',
+            'document-url': '#/$defs/DocumentUrl',
+            'video-url': '#/$defs/VideoUrl',
+            'binary': '#/$defs/BinaryContent',
+            'uploaded-file': '#/$defs/UploadedFile',
+        }
+    )
+    assert [choice['$ref'] for choice in multimodal['oneOf']] == snapshot(
+        [
+            '#/$defs/ImageUrl',
+            '#/$defs/AudioUrl',
+            '#/$defs/DocumentUrl',
+            '#/$defs/VideoUrl',
+            '#/$defs/BinaryContent',
+            '#/$defs/UploadedFile',
+        ]
+    )
 
 
 # Run out-of-process because `PYDANTIC_DISABLE_PLUGINS` is read once, when pydantic is imported.
